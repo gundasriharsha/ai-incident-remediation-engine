@@ -7,15 +7,19 @@ Integrated with:
 4. Automated Host Log Diagnostics
 5. Dynamic Runbook Ingestion
 6. Safe Whitelisted Subprocess Remediation Agent
+7. Real-Time Host Telemetry & Resource Gauges
+8. In-Chat One-Click Remediation Action Buttons
 """
 
 import os
+import re
 import glob
 import subprocess
 import shlex
 from typing import Tuple, List, Dict
 import streamlit as st
 import chromadb
+import psutil
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 from groq import Groq
@@ -61,7 +65,6 @@ def execute_safe_command(command_str: str) -> Tuple[bool, str]:
         return False, f"Security Policy Violation: Executable '{binary}' is not permitted in the safe diagnostics whitelist."
 
     try:
-        # Run process safely without raw shell=True to avoid injection
         process_run = subprocess.run(
             parsed_args,
             stdout=subprocess.PIPE,
@@ -77,6 +80,34 @@ def execute_safe_command(command_str: str) -> Tuple[bool, str]:
         return False, f"Command '{binary}' not found on host system."
     except Exception as ex:
         return False, f"Execution failed: {str(ex)}"
+
+
+def extract_remediation_commands(text: str) -> List[str]:
+    """
+    Extracts executable bash commands suggested inside markdown code blocks.
+    Filters candidate commands matching the allowed binary whitelist.
+    """
+    code_blocks = re.findall(r"```(?:bash|sh)?\n(.*?)```", text, re.DOTALL)
+    candidate_cmds = []
+    
+    for block in code_blocks:
+        for line in block.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("$ "):
+                line = line[2:].strip()
+            
+            try:
+                parts = shlex.split(line)
+                if parts:
+                    binary = os.path.basename(parts[0]).lower()
+                    if binary in ALLOWED_EXECUTABLES and line not in candidate_cmds:
+                        candidate_cmds.append(line)
+            except Exception:
+                continue
+                
+    return candidate_cmds
 
 
 @st.cache_resource
@@ -129,24 +160,44 @@ if "collection" not in st.session_state:
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+if "cmd_outputs" not in st.session_state:
+    st.session_state.cmd_outputs = {}
+
 # Sidebar configuration
 with st.sidebar:
     st.title("🛡️ AI-IRE")
     st.caption("AI Incident Remediation Engine")
     st.divider()
 
-    st.subheader("System Telemetry")
+    # --- Live System Telemetry Section ---
+    st.subheader("📊 Host Telemetry")
+    
+    cpu_usage = psutil.cpu_percent(interval=0.1)
+    ram_usage = psutil.virtual_memory().percent
+    disk_usage = psutil.disk_usage("/" if os.name != "nt" else "C:\\").percent
+
+    st.write(f"**CPU Utilization:** `{cpu_usage}%`")
+    st.progress(cpu_usage / 100)
+
+    st.write(f"**Memory (RAM) Usage:** `{ram_usage}%`")
+    st.progress(ram_usage / 100)
+
+    st.write(f"**Disk Storage Usage:** `{disk_usage}%`")
+    st.progress(disk_usage / 100)
+
+    st.divider()
+    st.subheader("⚙️ System Status")
     st.success("Vector DB: ChromaDB (Online)")
     st.info(f"Indexed Runbook Chunks: {st.session_state.chunk_count}")
     st.info("Embedding: all-MiniLM-L6-v2")
     st.info("Inference: Groq LPU (gpt-oss-120b)")
 
     st.divider()
-    st.subheader("⚡ Remediation Agent (Safe Execution)")
+    st.subheader("⚡ Remediation Agent (Manual Runner)")
     st.caption("Execute verified non-destructive diagnostic commands directly.")
     agent_cmd = st.text_input("Diagnostic Command", value="ping -c 3 8.8.8.8" if os.name != 'nt' else "ping -n 3 8.8.8.8")
     
-    if st.button("Run Remediation Command", use_container_width=True):
+    if st.button("Run Command", use_container_width=True):
         with st.spinner("Executing command on host environment..."):
             success, result = execute_safe_command(agent_cmd)
             if success:
@@ -188,16 +239,20 @@ with st.sidebar:
             log_sample = "\n".join(log_text.splitlines()[-40:])
 
             query_vector = embedder.encode([log_sample]).tolist()
-            search_results = st.session_state.collection.query(query_embeddings=query_vector, n_results=1)
+            # Fetch top-2 relevant runbook contexts for richer correlation
+            search_results = st.session_state.collection.query(
+                query_embeddings=query_vector, 
+                n_results=min(2, max(1, st.session_state.chunk_count))
+            )
 
-            matched_context = search_results["documents"][0][0]
-            matched_id = search_results["ids"][0][0]
+            matched_context = "\n\n---\n\n".join(search_results["documents"][0])
+            matched_id = ", ".join(search_results["ids"][0])
 
             triage_prompt = (
                 f"You are the AI Incident Remediation Engine analyzing raw infrastructure logs.\n\n"
                 f"Runbook Context:\n{matched_context}\n\n"
                 f"Log Snippet:\n```\n{log_sample}\n```\n\n"
-                f"Task: Identify failure pattern, correlate with runbook, and provide immediate root cause and CLI remediation steps."
+                f"Task: Identify failure pattern, correlate with runbook, and provide immediate root cause and CLI remediation steps in bash code blocks (```bash ... ```)."
             )
 
             with st.spinner("Triaging log dump against runbook..."):
@@ -229,6 +284,7 @@ with st.sidebar:
     st.divider()
     if st.button("Clear Chat Session", use_container_width=True):
         st.session_state.messages = []
+        st.session_state.cmd_outputs = {}
         st.rerun()
 
 # Main Chat View
@@ -237,11 +293,39 @@ st.markdown(
     "Runbook-grounded autonomous diagnostics, host log parsing, and safe operational remediation."
 )
 
-for msg in st.session_state.messages:
+for msg_idx, msg in enumerate(st.session_state.messages):
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
         if "reference" in msg and msg["reference"]:
             st.caption(f"📂 Runbook Match: `{msg['reference']}`")
+        
+        # Display One-Click remediation buttons for assistant responses
+        if msg["role"] == "assistant":
+            executable_candidates = extract_remediation_commands(msg["content"])
+            if executable_candidates:
+                st.markdown("##### ⚡ One-Click Remediation Actions")
+                for cmd_idx, candidate_cmd in enumerate(executable_candidates):
+                    action_key = f"action_{msg_idx}_{cmd_idx}"
+                    col1, col2 = st.columns([3, 1])
+                    with col1:
+                        st.code(candidate_cmd, language="bash")
+                    with col2:
+                        if st.button("Execute", key=action_key, use_container_width=True):
+                            with st.spinner("Executing safe remediation..."):
+                                success, output = execute_safe_command(candidate_cmd)
+                                st.session_state.cmd_outputs[action_key] = {
+                                    "success": success,
+                                    "output": output
+                                }
+                    
+                    if action_key in st.session_state.cmd_outputs:
+                        res = st.session_state.cmd_outputs[action_key]
+                        if res["success"]:
+                            st.success("Remediation Action Executed Successfully:")
+                            st.code(res["output"], language="bash")
+                        else:
+                            st.error("Remediation Action Blocked / Failed:")
+                            st.code(res["output"], language="bash")
 
 if user_prompt := st.chat_input("Describe the infrastructure incident or paste an error message..."):
     st.session_state.messages.append({"role": "user", "content": user_prompt})
@@ -249,20 +333,25 @@ if user_prompt := st.chat_input("Describe the infrastructure incident or paste a
         st.markdown(user_prompt)
 
     query_vector = embedder.encode([user_prompt]).tolist()
-    search_results = st.session_state.collection.query(query_embeddings=query_vector, n_results=1)
+    # Query top-2 matching chunks for balanced coverage
+    search_results = st.session_state.collection.query(
+        query_embeddings=query_vector, 
+        n_results=min(2, max(1, st.session_state.chunk_count))
+    )
 
-    matched_context = search_results["documents"][0][0]
-    matched_id = search_results["ids"][0][0]
+    matched_context = "\n\n---\n\n".join(search_results["documents"][0])
+    matched_id = ", ".join(search_results["ids"][0])
 
     system_instruction = (
         "You are the AI Incident Remediation Engine (AI-IRE).\n"
-        "Your objective is to diagnose server, storage, and container incidents based on the provided runbook context "
-        "and active conversation history.\n\n"
+        "Your objective is to diagnose server, network, storage, and container incidents.\n\n"
         "Rules:\n"
-        "1. For questions about prior conversation turns or session context, answer directly using the chat history.\n"
-        "2. For operational issues, prioritize the runbook context. If an incident resolution is completely absent from both "
-        "the context and history, state: 'Resolution context is not available in the ingested knowledge base.'\n"
-        "3. Provide structured, actionable CLI steps with code blocks where applicable."
+        "1. Prioritize provided runbook context for specific organizational operational procedures.\n"
+        "2. For general operational diagnostics (e.g., ping reachability, interface checks, DNS lookups, host uptime), "
+        "provide standard SRE verification steps even if not explicitly detailed in the runbook.\n"
+        "3. Only state 'Resolution context is not available in the ingested knowledge base' if the question targets a "
+        "proprietary or internal company policy that is strictly missing from context.\n"
+        "4. Always format executable CLI steps inside clean bash code blocks (```bash ... ```)."
     )
 
     history_payload = [{"role": "system", "content": system_instruction}]
@@ -292,6 +381,7 @@ if user_prompt := st.chat_input("Describe the infrastructure incident or paste a
                     "content": resolution_text,
                     "reference": matched_id
                 })
+                st.rerun()
 
             except Exception as e:
                 st.error(f"Inference failed: {e}")
