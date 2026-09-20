@@ -1,0 +1,5 @@
+cat << 'EOF' > sample_oom.log
+[Sun Sep 20 12:45:01 2026] node-worker-02 kernel: Task in /docker/938fae120 killed as a result of limit of /docker/938fae120
+[Sun Sep 20 12:45:01 2026] node-worker-02 kernel: memory: usage 2097152kB, limit 2097152kB, failcnt 48210
+[Sun Sep 20 12:45:01 2026] node-worker-02 kernel: Out of memory: Killed process 8912 (order-service) total-vm:4120912kB, anon-rss:2088192kB, file-rss:128kB
+EOF
